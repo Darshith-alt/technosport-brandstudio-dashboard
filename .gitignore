@@ -1,0 +1,13 @@
+# Never commit secrets or the tracker data
+.streamlit/secrets.toml
+data/*.xlsx
+data/*.csv
+*.json
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+.pytest_cache/
+.DS_Store

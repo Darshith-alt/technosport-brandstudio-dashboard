@@ -1,0 +1,28 @@
+# TechnoSport blue and orange theme
+[theme]
+base = "light"
+primaryColor = "#EB6834"            # orange: buttons, selected tab, sliders
+backgroundColor = "#F4F7FB"         # page background
+secondaryBackgroundColor = "#E6EDF7" # inputs, table headers
+textColor = "#0B1F3A"
+linkColor = "#1C5CAB"
+borderColor = "#D5DEEB"
+baseRadius = "10px"
+font = "sans-serif"
+chartCategoricalColors = ["#1C5CAB", "#6DA7EC", "#EB6834", "#B7B4AB"]
+
+[theme.sidebar]
+backgroundColor = "#0B2545"          # navy sidebar
+secondaryBackgroundColor = "#14335F"
+textColor = "#FFFFFF"
+primaryColor = "#EB6834"
+borderColor = "#24497A"
+
+[browser]
+gatherUsageStats = false
+
+[client]
+toolbarMode = "minimal"
+
+[server]
+maxUploadSize = 50
