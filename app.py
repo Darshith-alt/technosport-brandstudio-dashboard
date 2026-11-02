@@ -315,6 +315,11 @@ if df.empty:
     st.info("No SKUs match the filters. Clear a filter to see data.")
     st.stop()
 
+# Style-level frame (one row per style) for the TAT cards, step table and TAT
+# charts. The top KPI tiles, Pending, Team and All data tabs stay on the SKU
+# frame `df`.
+df_style = tk.style_tat_frame(df, cfg, today)
+
 # ---------------------------------------------------------------------------
 # KPIs
 # ---------------------------------------------------------------------------
@@ -342,11 +347,13 @@ status_tiles = [
 ]
 
 
-def tat_step_table() -> str:
-    """HTML table: one row per TAT step with counts and % of SKUs, plus an all-steps total."""
+# The TAT cards and step table count STYLES, not SKUs. df_style holds one row
+# per style with style-level TAT outcomes (see tracker.style_tat_frame).
+def tat_step_table(frame: pd.DataFrame) -> str:
+    """HTML table: one row per TAT step with counts and % of styles, plus an all-steps total."""
     rows, tot = [], {"n": 0, "on": 0, "over": 0, "within": 0}
-    for i, r in enumerate([r for r in cfg.tat if f"{r.deliverable}__tat_outcome" in df], start=1):
-        oc, target = df[f"{r.deliverable}__tat_outcome"], df[f"{r.deliverable}__tat_target"]
+    for i, r in enumerate([r for r in cfg.tat if f"{r.deliverable}__tat_outcome" in frame], start=1):
+        oc, target = frame[f"{r.deliverable}__tat_outcome"], frame[f"{r.deliverable}__tat_target"]
         n_rows = len(oc)
         on, over, within = int((oc == "On time").sum()), int((oc == "Overdue").sum()), int((oc == "Within TAT").sum())
         for k, v in (("n", n_rows), ("on", on), ("over", over), ("within", within)):
@@ -368,7 +375,7 @@ def tat_step_table() -> str:
     total = (f"<tr class='total'><td class='step'>All steps</td><td></td>"
              f"{cells(tot['n'], tot['on'], tot['over'], tot['within'])}</tr>")
     dot = lambda c: f"<i style='background:{c}'></i>"
-    head = ("<tr><th>Step</th><th>TAT</th><th class='num'>SKUs</th>"
+    head = ("<tr><th>Step</th><th>TAT</th><th class='num'>Styles</th>"
             f"<th class='num' colspan='2'>{dot(charts.BLUE_DARK)}Completed within TAT</th>"
             f"<th class='num' colspan='2'>{dot(charts.ORANGE)}Overdue</th>"
             f"<th class='num' colspan='2'>{dot(charts.BLUE_MID)}Pending, still within TAT</th></tr>")
@@ -376,48 +383,47 @@ def tat_step_table() -> str:
             f"<tbody>{body}{total}</tbody></table></div>")
 
 n_styles = df["style"].nunique()
+n_sku = len(df)
 
 
-def tat_card(d: str) -> str:
-    """Card for one deliverable: total, completed within TAT, pending, pending still within TAT."""
+def tat_card(frame: pd.DataFrame, d: str) -> str:
+    """Card for one deliverable, counted by STYLE: completed within TAT, overdue, pending."""
     label = cfg.label(d)
     rule = tat_rules.get(d)
-    if rule and f"{d}__tat_outcome" in df:
-        oc, target, due = df[f"{d}__tat_outcome"], df[f"{d}__tat_target"], df[f"{d}__tat_due"]
+    if rule and f"{d}__tat_outcome" in frame:
+        oc, target = frame[f"{d}__tat_outcome"], frame[f"{d}__tat_target"]
         counts = oc.value_counts()
         within, late = int(counts.get("On time", 0)), int(counts.get("Late", 0))
         no_date = int(counts.get("Done, no edit date", 0))
         open_ok, overdue = int(counts.get("Within TAT", 0)), int(counts.get("Overdue", 0))
         not_started = int(counts.get("Not started", 0))
-        pending = open_ok + overdue + not_started
         start_word = "Shoot" if rule.start == "shoot" else "Inward"
         tgt = f"{target.min():g}" if target.min() == target.max() else f"{target.min():g}–{target.max():g}"
         pill = f"TAT {tgt} days"
         segments = [(within, charts.BLUE_DARK), (late + no_date, charts.GREY),
                     (open_ok, charts.BLUE_MID), (overdue, charts.ORANGE), (not_started, charts.GREY_LIGHT)]
-        n_card = len(df)
+        n_card = len(frame)
         stats = [
             ("Completed within TAT", f"{within:,}", charts.BLUE_DARK, pct(within, n_card)),
             ("Overdue", f"{overdue:,}", charts.ORANGE, pct(overdue, n_card)),
             ("Pending, still within TAT", f"{open_ok:,}", charts.BLUE_MID, pct(open_ok, n_card)),
         ]
-        avg = df.loc[oc.isin(["On time", "Late"]), f"{d}__tat_days"].mean()
+        avg = frame.loc[oc.isin(["On time", "Late"]), f"{d}__tat_days"].mean()
         foot = []
         if pd.notna(avg):
             foot.append(f"Average {avg:.1f} days")
         if late + no_date:
             foot.append(f"{late + no_date:,} more completed (late or without a date)")
     else:  # tracker without TAT columns: done vs pending only
-        status = df[f"{d}__status"]
+        status = frame[f"{d}__status"]
         done = int(status.isin(["Done", "Outsourced", "Not needed"]).sum())
-        pending = len(df) - done
+        pending = len(frame) - done
         start_word, pill = "Inward", "No TAT set"
         segments = [(done, charts.BLUE_DARK), (pending, charts.ORANGE)]
-        stats = [("Completed", f"{done:,}", charts.BLUE_DARK, pct(done, len(df))),
-                 ("Pending", f"{pending:,}", charts.ORANGE, pct(pending, len(df)))]
-        avg = df[f"{d}__days"].mean()
-        foot = [f"Average {avg:.1f} days from inward"] if pd.notna(avg) else []
-    total = len(df)
+        stats = [("Completed", f"{done:,}", charts.BLUE_DARK, pct(done, len(frame))),
+                 ("Pending", f"{pending:,}", charts.ORANGE, pct(pending, len(frame)))]
+        foot = []
+    total = len(frame)
     bar = "".join(f"<span style='width:{v / total * 100:.2f}%;background:{c}'></span>" for v, c in segments if v)
     stat_html = "".join(
         f"<div class='stat'><div class='k'><i style='background:{c}'></i>{html.escape(k)}</div>"
@@ -426,23 +432,23 @@ def tat_card(d: str) -> str:
     return (
         f"<div class='tat-card'><div class='head'><span class='title'>{start_word} → {html.escape(label)}</span>"
         f"<span class='pill'>{html.escape(pill)}</span></div>"
-        f"<div class='total'><b>{total:,}</b>SKU{'s' if total != 1 else ''} · {n_styles:,} style{'s' if n_styles != 1 else ''}</div>"
+        f"<div class='total'><b>{n_styles:,}</b>style{'s' if n_styles != 1 else ''} · {n_sku:,} SKU{'s' if n_sku != 1 else ''}</div>"
         f"<div class='mini'>{bar}</div><div class='stats'>{stat_html}</div>"
         + (f"<div class='foot'>{html.escape(' · '.join(foot))}</div>" if foot else "") + "</div>"
     )
 
 
-tat_steps = [r.deliverable for r in cfg.tat if f"{r.deliverable}__tat_outcome" in df] or list(cfg.deliverables)
-tat_cards = [tat_card(d) for d in tat_steps]
+tat_steps = [r.deliverable for r in cfg.tat if f"{r.deliverable}__tat_outcome" in df_style] or list(cfg.deliverables)
+tat_cards = [tat_card(df_style, d) for d in tat_steps]
 
 kpi_html = (
     f"<div class='kpi-grid' style='grid-template-columns: repeat({len(status_tiles)}, minmax(0, 1fr))'>"
     + "".join(status_tiles) + "</div>"
-    + "<div class='kpi-section'>Turnaround vs TAT <span>· SKU counts, calendar days</span></div>"
+    + "<div class='kpi-section'>Turnaround vs TAT <span>· style counts, calendar days</span></div>"
     + f"<div class='tat-grid n{min(len(tat_cards), 4)}'>"
     + "".join(tat_cards) + "</div>"
-    + ("<div class='kpi-section'>TAT summary by step <span>· % = share of SKUs in each step</span></div>"
-       + tat_step_table() if cfg.tat else "")
+    + ("<div class='kpi-section'>TAT summary by step <span>· % = share of styles in each step</span></div>"
+       + tat_step_table(df_style) if cfg.tat else "")
 )
 st.markdown(kpi_html, unsafe_allow_html=True)
 
@@ -472,21 +478,21 @@ with tab_overview:
     if focus:
         with left:
             box = card("pipeline", "TAT status by step",
-                       "Completed within TAT, overdue, and pending still within TAT. " + TAT_NOTE)
-            t = tk.tat_view_by_deliverable(df, cfg)
-            show_chart(box, charts.stacked_bars(t, charts.TAT_VIEW_COLORS), "pipeline", t)
-            box = card("weekly", f"{focus_label}: by inward week", "SKUs grouped by the week they were inwarded.")
-            t = tk.tat_view_table(df, focus, "inward_week").sort_index()
+                       "Styles: completed within TAT, overdue, and pending still within TAT. " + TAT_NOTE)
+            t = tk.tat_view_by_deliverable(df_style, cfg)
+            show_chart(box, charts.stacked_bars(t, charts.TAT_VIEW_COLORS, value_name="styles"), "pipeline", t)
+            box = card("weekly", f"{focus_label}: by inward week", "Styles grouped by the week they were inwarded.")
+            t = tk.tat_view_table(df_style, focus, "inward_week").sort_index()
             tt = t.copy()
             tt.index = [d.strftime("%d %b %Y") for d in tt.index]
-            show_chart(box, charts.stacked_columns(t, charts.TAT_VIEW_COLORS, "Inward week (starting Monday)"), "weekly", tt)
+            show_chart(box, charts.stacked_columns(t, charts.TAT_VIEW_COLORS, "Inward week (starting Monday)", value_name="styles"), "weekly", tt)
         with right:
             box = card("category", f"{focus_label}: by super category")
-            t = tk.tat_view_table(df, focus, "super_category")
-            show_chart(box, charts.stacked_bars(t, charts.TAT_VIEW_COLORS), "category", t)
+            t = tk.tat_view_table(df_style, focus, "super_category")
+            show_chart(box, charts.stacked_bars(t, charts.TAT_VIEW_COLORS, value_name="styles"), "category", t)
             box = card("project", f"{focus_label}: by project (shoot type)")
-            t = tk.tat_view_table(df, focus, "project")
-            show_chart(box, charts.stacked_bars(t, charts.TAT_VIEW_COLORS), "project", t)
+            t = tk.tat_view_table(df_style, focus, "project")
+            show_chart(box, charts.stacked_bars(t, charts.TAT_VIEW_COLORS, value_name="styles"), "project", t)
     else:  # tracker without TAT (e.g. Video Shoot): progress by stage
         sl = tk.status_long(df, cfg)
         status_tbl = sl.pivot_table(index="Step", columns="Status", values="SKUs", aggfunc="sum", fill_value=0,
@@ -594,7 +600,7 @@ if tab_tat is not None:
 with tab_break:
     def breakdown(dim: str, order: list | None = None) -> pd.DataFrame:
         if focus:
-            return tk.tat_view_table(df, focus, dim, order)
+            return tk.tat_view_table(df_style, focus, dim, order)
         return stage_table(df, dim, order)
 
     colors = charts.TAT_VIEW_COLORS if focus else charts.STAGE_COLORS
