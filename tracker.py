@@ -81,6 +81,12 @@ TRACKERS = {
         crew_col="VideoGrapher",
         crew_label="Videographer",
         deliverables=("GT Videos", "MT Videos"),
+        # TAT columns in the Video Shoot sheet: TAT GT Video / TAT MT Video.
+        # Only two steps, both counted from the inward date; blank cells use default_days.
+        tat=(
+            TatRule("GT Videos", "TAT GT Video", "Actual GT Video", "Variance GT Video", 15, start="inward"),
+            TatRule("MT Videos", "TAT MT Video", "Actual MT Video", "Variance MT Video", 3, start="inward"),
+        ),
     ),
 }
 
@@ -750,3 +756,86 @@ def tat_view_by_deliverable(df: pd.DataFrame, cfg: TrackerConfig) -> pd.DataFram
         return pd.DataFrame()
     t = pd.DataFrame(rows).T.fillna(0).astype(int)
     return t.reindex(columns=[c for c in TAT_VIEW_ORDER if c in t.columns])
+
+
+# ---------------------------------------------------------------------------
+# Style-level rollup (one row per style) for the TAT cards, table and charts
+# ---------------------------------------------------------------------------
+# A style (e.g. "P990/01") groups several SKU rows (colours / sizes). The TAT
+# cards count styles, not SKUs, timed by each style's LATEST edit date against
+# the style's TAT, counted from its EARLIEST inward/shoot date. A deliverable is
+# only "completed" for the style when every SKU in it is done.
+
+
+def style_tat_frame(df: pd.DataFrame, cfg: TrackerConfig, today: date | None = None) -> pd.DataFrame:
+    """Collapse the SKU frame to one row per style with style-level TAT columns.
+
+    The returned frame has the same ``{deliverable}__tat_*`` columns the SKU frame
+    has, so every TAT view (cards, step table, charts, summary) works on it
+    unchanged — it just counts styles instead of SKUs.
+    """
+    today = pd.Timestamp(today or date.today()).normalize()
+    if df.empty or not cfg.tat:
+        return df.iloc[0:0].copy()
+
+    style_key = df["style"].fillna("Not set")
+    groups = df.groupby(style_key, sort=False)
+
+    # Carry over a few descriptive columns (first value per style) for breakdown charts.
+    carry = ["style", "vertical", "super_category", "project", "budget", "ideal_for"]
+    out = groups.agg({c: "first" for c in carry if c in df.columns})
+    out["sku"] = groups.size().values            # SKUs in the style (kept for reference)
+    out["style"] = out.index.astype(object)
+    out["inward_date"] = groups["inward_date"].min().values
+    out["shoot_date"] = groups["shoot_date"].min().values
+    out["inward_week"] = week_start(pd.to_datetime(out["inward_date"]))
+
+    SHOT = set(SHOT_STATUSES)
+
+    for rule in cfg.tat:
+        d = rule.deliverable
+        if f"{d}__tat_outcome" not in df:
+            continue
+        g = groups
+
+        # Style start = earliest inward (or shoot) date across the style's SKUs.
+        start = g["shoot_date"].min() if rule.start == "shoot" else g["inward_date"].min()
+        start = pd.to_datetime(start)
+
+        # Style edit date = latest edit date, but only once EVERY SKU is done.
+        edit = g[f"{d}__edit_date"]
+        all_done = g[f"{d}__status"].apply(lambda s: bool(s.isin(list(SHOT) + ["Not needed"]).all()))
+        any_missing_edit = g[f"{d}__edit_date"].apply(lambda s: bool(s.isna().any()))
+        latest_edit = pd.to_datetime(edit.max())
+        # Completed (measurable) only when all SKUs done AND all have an edit date.
+        complete_edit = latest_edit.where(all_done & ~any_missing_edit)
+
+        target = g[f"{d}__tat_target"].max()          # same TAT across a style; max is safe
+        tat_days = (complete_edit - start).dt.days
+        tat_days = tat_days.where(tat_days >= 0)
+        open_days = (today - start).dt.days
+        has_days = tat_days.notna()
+        all_not_needed = g[f"{d}__status"].apply(lambda s: bool(s.eq("Not needed").all()))
+
+        outcome = np.select(
+            [has_days & (tat_days <= target), has_days,
+             all_not_needed.to_numpy(),
+             (all_done & ~has_days).to_numpy(),          # done but no measurable edit date
+             (open_days > target).to_numpy(), open_days.notna().to_numpy()],
+            ["On time", "Late", "Not needed", "Done, no edit date", "Overdue", "Within TAT"],
+            default="Not started",
+        )
+
+        out[f"{d}__tat_target"] = target.values
+        out[f"{d}__tat_start"] = start.values
+        out[f"{d}__tat_due"] = (start + pd.to_timedelta(target, unit="D")).values
+        out[f"{d}__tat_days"] = tat_days.values
+        out[f"{d}__tat_open_days"] = open_days.where(~has_days).values
+        out[f"{d}__tat_outcome"] = outcome
+        out[f"{d}__tat_days_over"] = np.where(outcome == "Late", (tat_days - target).values,
+                                              np.where(outcome == "Overdue", (open_days - target).values, np.nan))
+        out[f"{d}__edit_date"] = complete_edit.values
+        out[f"{d}__status"] = np.where(all_done.values, "Done",
+                                       np.where(all_not_needed.values, "Not needed", "Pending"))
+
+    return out.reset_index(drop=True)
