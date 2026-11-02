@@ -318,7 +318,10 @@ if df.empty:
 # Style-level frame (one row per style) for the TAT cards, step table and TAT
 # charts. The top KPI tiles, Pending, Team and All data tabs stay on the SKU
 # frame `df`.
-df_style = tk.style_tat_frame(df, cfg, today)
+if cfg.tat:
+    df_style = tk.style_tat_frame(df, cfg, today)
+else:
+    df_style = df.copy()
 
 # ---------------------------------------------------------------------------
 # KPIs
