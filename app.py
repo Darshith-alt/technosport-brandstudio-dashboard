@@ -25,9 +25,6 @@ import tracker as tk
 IST = ZoneInfo("Asia/Kolkata")
 APP_DIR = Path(__file__).parent
 
-# TAT steps that are counted per SKU. Every other step is counted per style.
-SKU_BASED_STEPS = {"Shoot"}
-
 st.set_page_config(page_title="Brand Studio · Shoot Dashboard", page_icon="📸", layout="wide",
                    initial_sidebar_state="auto")
 
@@ -244,6 +241,12 @@ if not available:
     st.stop()
 tracker_name = st.sidebar.radio("Tracker", available, index=0)
 cfg = tk.TRACKERS[tracker_name]
+
+# TAT steps that are counted per SKU. Every other step is counted per style.
+#   Photo Shoot: Inward -> Shoot
+#   Video Shoot: Inward -> Shoot and Inward -> MT Videos
+SKU_BASED_STEPS = {"Shoot"} | ({"MT Videos"} if tracker_name == "Video Shoot" else set())
+
 outsourced_ok = st.sidebar.toggle(
     "Count outsourced as complete", value=True,
     help="On: a deliverable marked 'Outsource' counts as handled. Off: only 'Done' counts as complete.")
@@ -324,8 +327,8 @@ if df.empty:
     st.stop()
 
 # Style-level frame (one row per style) for the style-based TAT cards, step table
-# and TAT charts. The Inward -> Shoot card, the top KPI tiles, Pending, Team and
-# All data tabs stay on the SKU frame `df`.
+# and TAT charts. SKU-based steps (see SKU_BASED_STEPS), the top KPI tiles,
+# Pending, Team and All data tabs stay on the SKU frame `df`.
 if cfg.tat:
     df_style = tk.style_tat_frame(df, cfg, today)
 else:
@@ -361,6 +364,13 @@ n_styles = df["style"].nunique()
 n_sku = len(df)
 
 
+def step_name(d: str) -> str:
+    """'Inward → Shoot', 'Shoot → MT Catalog Image', ..."""
+    rule = tat_rules.get(d)
+    start_word = "Shoot" if rule is not None and rule.start == "shoot" else "Inward"
+    return f"{start_word} → {cfg.label(d)}"
+
+
 def tat_buckets(oc: pd.Series) -> tuple[int, int, int]:
     """Split TAT outcomes into three groups that always add up to the total:
     (completed within TAT, overdue, pending still within TAT).
@@ -383,7 +393,7 @@ def tat_target_text(target: pd.Series) -> str:
 
 
 def tat_step_table(sku_frame: pd.DataFrame, style_frame: pd.DataFrame) -> str:
-    """HTML summary table: one row per TAT step. Shoot is counted in SKUs, other steps in styles."""
+    """HTML summary table: one row per TAT step. SKU-based steps count SKUs, the rest count styles."""
     steps = [r for r in cfg.tat if f"{r.deliverable}__tat_outcome" in style_frame]
     if not steps:
         return ""
@@ -393,8 +403,7 @@ def tat_step_table(sku_frame: pd.DataFrame, style_frame: pd.DataFrame) -> str:
         frame = sku_frame if sku_based else style_frame
         oc, target = frame[f"{r.deliverable}__tat_outcome"], frame[f"{r.deliverable}__tat_target"]
         within, over, pend = tat_buckets(oc)
-        start_word = "Shoot" if r.start == "shoot" else "Inward"
-        rows.append((f"{i}. {start_word} → {cfg.label(r.deliverable)}", f"{tat_target_text(target)} days",
+        rows.append((f"{i}. {step_name(r.deliverable)}", f"{tat_target_text(target)} days",
                      "SKUs" if sku_based else "Styles", len(oc), within, over, pend))
 
     def cells(total, within, over, pend):
@@ -424,9 +433,7 @@ def stage_completion_table(frame: pd.DataFrame) -> str:
     key = frame["style"].fillna("Not set")
     steps = [("Inward → Shoot", frame["shoot_status"].isin(tk.SHOT_STATUSES))]
     for d in cfg.deliverables:
-        rule = tat_rules.get(d)
-        start_word = "Shoot" if rule is not None and rule.start == "shoot" else "Inward"
-        steps.append((f"{start_word} → {cfg.label(d)}", frame[f"{d}__status"].isin(ok)))
+        steps.append((step_name(d), frame[f"{d}__status"].isin(ok)))
 
     body = ""
     for name, flag in steps:
@@ -501,11 +508,15 @@ for d in tat_steps:
     sku_based = d in SKU_BASED_STEPS and f"{d}__tat_outcome" in df
     tat_cards.append(tat_card(df if sku_based else df_style, d, "SKUs" if sku_based else "Styles"))
 
+sku_step_names = [step_name(r.deliverable) for r in cfg.tat
+                  if r.deliverable in SKU_BASED_STEPS and f"{r.deliverable}__tat_outcome" in df]
+sku_note = (" and ".join(sku_step_names) + " counted in SKUs, other steps in styles") if sku_step_names \
+    else "counted in styles"
+
 kpi_html = (
     f"<div class='kpi-grid' style='grid-template-columns: repeat({len(status_tiles)}, minmax(0, 1fr))'>"
     + "".join(status_tiles) + "</div>"
-    + "<div class='kpi-section'>Turnaround vs TAT <span>· Inward → Shoot counted in SKUs, other steps in styles · "
-      "calendar days</span></div>"
+    + f"<div class='kpi-section'>Turnaround vs TAT <span>· {html.escape(sku_note)} · calendar days</span></div>"
     + f"<div class='tat-grid n{min(len(tat_cards), 4)}'>"
     + "".join(tat_cards) + "</div>"
     + ("<div class='kpi-section'>TAT summary by step <span>· % = share of the step's total "
