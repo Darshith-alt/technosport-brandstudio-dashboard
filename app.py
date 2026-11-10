@@ -25,6 +25,42 @@ import tracker as tk
 IST = ZoneInfo("Asia/Kolkata")
 APP_DIR = Path(__file__).parent
 
+# Steps whose TAT clock starts at the SHOOT date instead of the inward date (Photo Shoot).
+#   Inward -> Shoot (per SKU) · Shoot -> Master Poster (per style) · Shoot -> PDF (per style)
+#   Shoot -> MT Catalog Image (per SKU)
+SHOOT_START_LABELS = {"master poster", "pdf", "mt catalog image"}
+
+
+def _force_shoot_start() -> None:
+    """Set start = 'shoot' on the Photo Shoot TAT rules listed above.
+    Safe: if the tracker config can't be changed, the app keeps running as before."""
+    import dataclasses
+    for name, c in list(tk.TRACKERS.items()):
+        if "photo" not in str(name).lower():
+            continue
+        try:
+            rules, changed = [], False
+            for r in c.tat:
+                if str(c.label(r.deliverable)).strip().lower() in SHOOT_START_LABELS and r.start != "shoot":
+                    try:
+                        r = dataclasses.replace(r, start="shoot")
+                    except TypeError:
+                        object.__setattr__(r, "start", "shoot")
+                    changed = True
+                rules.append(r)
+            if not changed:
+                continue
+            rules = tuple(rules) if isinstance(c.tat, tuple) else rules
+            try:
+                tk.TRACKERS[name] = dataclasses.replace(c, tat=rules)
+            except TypeError:
+                object.__setattr__(c, "tat", rules)
+        except Exception:
+            pass
+
+
+_force_shoot_start()
+
 st.set_page_config(page_title="Brand Studio · Shoot Dashboard", page_icon="📸", layout="wide",
                    initial_sidebar_state="auto")
 
