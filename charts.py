@@ -5,6 +5,7 @@ Colour meaning is the same in every chart:
   mid blue   = outsourced / in editing (on its way)
   orange     = pending / overdue (needs attention)
   dark orange = finished late (TAT)
+  purple     = done by the agency
   grey       = other / not recorded
 """
 from __future__ import annotations
@@ -21,6 +22,7 @@ ORANGE = "#EB6834"
 ORANGE_DARK = "#C2410C"
 GREY = "#B7B4AB"
 GREY_LIGHT = "#D9DDE5"
+AGENCY = "#6B4FA0"    # purple = done by the agency
 
 INK = "#0B1F3A"
 INK_2 = "#52607A"
@@ -32,13 +34,17 @@ FONT = "system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif"
 
 STATUS_COLORS = {"Done": BLUE_DARK, "Outsourced": BLUE_MID, "Pending": ORANGE, "Other": GREY, "Not needed": GREY_LIGHT}
 STAGE_COLORS = {"Complete": BLUE_DARK, "In editing": BLUE_MID, "Pending shoot": ORANGE}
-TAT_VIEW_COLORS = {"Completed within TAT": BLUE_DARK, "Overdue": ORANGE,
-                   "Pending · still within TAT": BLUE_MID, "Pending · not shot yet": GREY_LIGHT}
+TAT_VIEW_COLORS = {"Completed within TAT": BLUE_DARK, "Completed overdue": ORANGE_DARK,
+                   "Pending within TAT": BLUE_MID, "Pending overdue": ORANGE, "Done by agency": AGENCY,
+                   # older group names, kept so existing charts keep their colours
+                   "Overdue": ORANGE, "Pending · still within TAT": BLUE_MID,
+                   "Pending · not shot yet": GREY_LIGHT, "Not counted": GREY_LIGHT}
 TAT_COLORS = {"On time": BLUE_DARK, "Late": ORANGE_DARK, "Within TAT": BLUE_MID, "Overdue": ORANGE,
-              "Done, no edit date": GREY, "Not started": GREY_LIGHT, "Not needed": GREY_LIGHT}
+              "Done, no edit date": GREY, "Not started": GREY_LIGHT, "Not needed": GREY_LIGHT,
+              "Done by agency": AGENCY}
 # Label colour inside each fill (white on dark fills, dark ink on light fills)
 _LABEL_ON = {BLUE_DARK: "#FFFFFF", ORANGE: "#FFFFFF", ORANGE_DARK: "#FFFFFF", BLUE_MID: INK, GREY: INK,
-             GREY_LIGHT: INK, BLUE: "#FFFFFF"}
+             GREY_LIGHT: INK, BLUE: "#FFFFFF", AGENCY: "#FFFFFF"}
 
 PLOTLY_CONFIG = {
     "displaylogo": False,
