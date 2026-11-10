@@ -605,6 +605,32 @@ def tat_report_table(stats: list[dict]) -> str:
             f"<tbody>{body}</tbody></table></div>")
 
 
+def stage_completion_report(stats: list[dict]) -> str:
+    """Stage-wise completion from the TAT engine: same steps and same per-SKU / per-style counting
+    as the TAT cards. Completed = within TAT + overdue, Pending = within TAT + overdue."""
+    dot = lambda c: f"<i style='background:{c}'></i>"
+    agency_c = getattr(charts, "AGENCY", "#6B4FA0")
+    head = ("<tr><th>Stage</th><th>Counted in</th><th class='num'>Total</th>"
+            f"<th class='num' colspan='2'>{dot(charts.BLUE_DARK)}Completed</th>"
+            f"<th class='num' colspan='2'>{dot(agency_c)}Done by agency</th>"
+            f"<th class='num' colspan='2'>{dot(charts.ORANGE)}Pending</th>"
+            "<th class='num'>Not counted</th></tr>")
+    body = ""
+    for i, s_ in enumerate(stats, start=1):
+        total = s_["counted"]
+        done = s_["c_within"] + s_["c_over"]
+        pend = s_["p_within"] + s_["p_over"]
+        ag = (f"<td class='num'>{s_['agency']:,}</td><td class='pc'>{pct(s_['agency'], total)}</td>"
+              if s_["key"] != "shoot" else "<td class='num'>–</td><td class='pc'></td>")
+        body += (f"<tr><td class='step'>{i}. {html.escape(s_['label'])}</td><td class='basis'>{s_['basis']}</td>"
+                 f"<td class='num'>{total:,}</td>"
+                 f"<td class='num'>{done:,}</td><td class='pc'>{pct(done, total)}</td>{ag}"
+                 f"<td class='num'>{pend:,}</td><td class='pc'>{pct(pend, total)}</td>"
+                 f"<td class='num'>{s_['not_counted']:,}</td></tr>")
+    return (f"<div class='tat-table-wrap'><table class='tat-table'><thead>{head}</thead>"
+            f"<tbody>{body}</tbody></table></div>")
+
+
 # ---------------------------------------------------------------------------
 # App
 # ---------------------------------------------------------------------------
@@ -801,9 +827,12 @@ kpi_html = (
        + "<div class='kpi-section'>TAT summary by step <span>· % = share of the step's counted total "
          "· not counted = not shot yet or no TAT</span></div>"
        + tat_report_table(tat_stats) if tat_stats else "")
-    + "<div class='kpi-section'>Stage-wise completion <span>· styles · completed = every SKU in the style has "
-      "finished the stage · pending includes overdue</span></div>"
-    + stage_completion_table(df)
+    + ("<div class='kpi-section'>Stage-wise completion <span>· same steps and counting as the cards · "
+       "completed = within TAT + overdue · pending = within TAT + overdue · a style is completed only when "
+       "every SKU has finished</span></div>" + stage_completion_report(tat_stats)
+       if tat_stats else
+       "<div class='kpi-section'>Stage-wise completion <span>· styles · completed = every SKU in the style has "
+       "finished the stage · pending includes overdue</span></div>" + stage_completion_table(df))
 )
 if tat_error:
     st.warning(tat_error)
