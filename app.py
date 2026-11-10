@@ -389,7 +389,7 @@ BUCKET_KEYS = ["c_within", "c_over", "p_within", "p_over", "agency"]
 BUCKET_LABELS = {"c_within": "Completed within TAT", "c_over": "Completed overdue",
                  "p_within": "Pending within TAT", "p_over": "Pending overdue", "agency": "Done by agency"}
 BUCKET_COLORS = {"c_within": charts.BLUE_DARK, "c_over": charts.ORANGE_DARK, "p_within": charts.BLUE_MID,
-                 "p_over": charts.ORANGE, "agency": charts.AGENCY}
+                 "p_over": charts.ORANGE, "agency": getattr(charts, "AGENCY", "#6B4FA0")}
 
 
 def tat_buckets(oc: pd.Series) -> dict:
