@@ -11,8 +11,10 @@ from __future__ import annotations
 
 import hmac
 import html
+import io
 import os
-from datetime import datetime
+import re
+from datetime import date as date_cls, datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -264,6 +266,346 @@ def multiselect_filter(container, label: str, series: pd.Series, key: str) -> li
 
 
 # ---------------------------------------------------------------------------
+# TAT engine (same rules as the Apps Script email report)
+# ---------------------------------------------------------------------------
+# RULES (per step, per style / per SKU)
+#  1. A style/SKU is judged from the Actual column of that step (Actual Shoot, Actual MT, ...).
+#  2. Every SKU of the group has an Actual number -> COMPLETED.
+#     The slowest SKU decides: Actual <= TAT = Completed within TAT, else Completed overdue.
+#  3. No SKU of the group has an Actual number -> PENDING (BLANK_ACTUAL_* = "skip" leaves it out).
+#     Pending within TAT / Pending overdue = days since the start date vs TAT.
+#  4. Only some SKUs of a style are finished -> style is PENDING.
+#     (PARTIAL_STYLE = "completed" judges it from the finished SKUs instead)
+#  5. TAT cell blank -> not counted for that step.
+#  6. "Shoot -> ..." steps: pending clock starts at the shoot date; not shot yet = not counted
+#     (for a style, every SKU of the style must be shot).
+#  7. DONE BY AGENCY (deliverable steps): Actual blank AND the step's Edit Date cell says
+#     "Done By Agency" -> own bucket. Actual blank + Edit Date blank -> pending.
+#     Actual blank but Edit Date is a real date -> completed, days = Edit Date - start date.
+#     Style: all SKUs agency -> agency; agency + finished SKUs -> completed; any open SKU -> pending.
+#
+# Current setup:
+#   Photo Shoot: Inward -> Shoot (SKU) · Shoot -> Master Poster (style) · Shoot -> PDF (style)
+#                · Shoot -> MT Catalog Image (SKU)
+#   Video Shoot: Inward -> GT Videos (style) · Inward -> MT Videos (style)
+
+BLANK_ACTUAL_STYLE = "pending"     # style with nothing finished:  "pending" | "skip"
+BLANK_ACTUAL_SKU = "pending"       # SKU with nothing finished:    "pending" | "skip"
+PARTIAL_STYLE = "pending"          # style with some SKUs finished: "pending" | "completed"
+BLANK_TAT_USES_DEFAULT = False     # blank TAT cell: True = use the default TAT, False = not counted
+
+# Header names are lower case; first match wins.
+#   basis "Styles" | "SKUs" | "Both" (two cards: style-wise and SKU-wise)
+#   start "inward" = days from the inward date | "shoot" = from the shoot date
+TAT_SETUP = {
+    "photo shoot": {
+        "crew": ["photographer"], "shoot_outsourced": False,
+        "shoot_tat": {"col": ["shoot tat"], "actual_col": ["actual shoot"], "tat": 2, "basis": "SKUs"},
+        "steps": [
+            {"key": "poster", "label": "Shoot → Master Poster", "deliverable": ["master poster"],
+             "tat_col": ["tat poster"], "actual_col": ["actual poster"], "tat": 7, "start": "shoot", "basis": "Styles"},
+            {"key": "pdf", "label": "Shoot → PDF", "deliverable": ["pdf"],
+             "tat_col": ["tat pdf"], "actual_col": ["actual pdf"], "tat": 15, "start": "shoot", "basis": "Styles"},
+            {"key": "mt", "label": "Shoot → MT Catalog Image", "deliverable": ["mt catalog image"],
+             "tat_col": ["tat mt"], "actual_col": ["actual mt"], "tat": 3, "start": "shoot", "basis": "SKUs"},
+        ],
+    },
+    "video shoot": {
+        "crew": ["videographer", "video grapher", "photographer"], "shoot_outsourced": True,
+        "shoot_tat": None,
+        "steps": [
+            {"key": "gt", "label": "Inward → GT Videos", "deliverable": ["gt videos", "gt video"],
+             "tat_col": ["tat gt video", "tat gt videos"], "actual_col": ["actual gt video", "actual gt videos"],
+             "tat": 15, "start": "inward", "basis": "Styles"},
+            {"key": "mt", "label": "Inward → MT Videos", "deliverable": ["mt videos", "mt video"],
+             "tat_col": ["tat mt video", "tat mt videos"], "actual_col": ["actual mt video", "actual mt videos"],
+             "tat": 3, "start": "inward", "basis": "Styles"},
+        ],
+    },
+}
+
+TAT_BUCKETS = [  # key, label, colour
+    ("c_within", "Completed within TAT", charts.BLUE_DARK),
+    ("c_over", "Completed overdue", charts.ORANGE_DARK),
+    ("p_within", "Pending within TAT", charts.BLUE_MID),
+    ("p_over", "Pending overdue", charts.ORANGE),
+    ("agency", "Done by agency", getattr(charts, "AGENCY", "#6B4FA0")),
+]
+_NUM_RE = re.compile(r"^\s*[-+]?(\d+\.?\d*|\.\d+)")
+_MDY_RE = re.compile(r"^(\d{1,2})[/\-.](\d{1,2})[/\-.](\d{2,4})")
+_ISO_RE = re.compile(r"^(\d{4})-(\d{2})-(\d{2})")
+
+
+def _norm(v) -> str:
+    if v is None or (isinstance(v, float) and pd.isna(v)):
+        return ""
+    return re.sub(r"\s+", " ", str(v)).strip().lower()
+
+
+def _blank(v) -> bool:
+    return v is None or (isinstance(v, float) and pd.isna(v)) or (isinstance(v, str) and not v.strip()) \
+        or v is pd.NaT
+
+
+def _day(v):
+    """Date cell -> day number (date.toordinal). Text dates are month/day/year. Time part ignored."""
+    if _blank(v):
+        return None
+    if isinstance(v, (datetime, pd.Timestamp)):
+        return v.date().toordinal()
+    if isinstance(v, date_cls):
+        return v.toordinal()
+    s = str(v).strip()
+    m = _MDY_RE.match(s)
+    if m:
+        mo, d, y = int(m.group(1)), int(m.group(2)), int(m.group(3))
+        if y < 100:
+            y += 2000
+        if mo > 12 and d <= 12:  # can't be month/day/year, so swap rather than lose the row
+            mo, d = d, mo
+        try:
+            return date_cls(y, mo, d).toordinal()
+        except ValueError:
+            return None
+    m = _ISO_RE.match(s)
+    if m:
+        try:
+            return date_cls(int(m.group(1)), int(m.group(2)), int(m.group(3))).toordinal()
+        except ValueError:
+            return None
+    return None
+
+
+def _num(v):
+    """Number from a cell, or None when blank / not a number."""
+    if _blank(v) or isinstance(v, (bool, datetime, date_cls, pd.Timestamp)):
+        return None
+    if isinstance(v, (int, float)):
+        return float(v)
+    m = _NUM_RE.match(str(v))
+    return float(m.group(0)) if m else None
+
+
+def _is_agency(v) -> bool:
+    return isinstance(v, str) and "agency" in v.lower()
+
+
+@st.cache_data(show_spinner=False)
+def tat_read_rows(data: bytes, sheet: str, kind: str) -> list[dict]:
+    """Read one tracker sheet straight from the workbook (one dict per SKU row)."""
+    setup = TAT_SETUP[kind]
+    raw = pd.read_excel(io.BytesIO(data), sheet_name=sheet, header=None, dtype=object)
+    values = raw.where(pd.notna(raw), None).values.tolist()
+
+    hr = next((i for i, row in enumerate(values[:15])
+               if "sku" in [_norm(x) for x in row] and "inward date" in [_norm(x) for x in row]), -1)
+    if hr < 0:
+        raise ValueError(f'Header row (SKU / inward date) not found in "{sheet}".')
+    H = [_norm(x) for x in values[hr]]
+
+    def find_any(names):
+        return next((H.index(n) for n in names if n in H), -1)
+
+    def need(names):
+        ix = find_any(names)
+        if ix < 0:
+            raise ValueError(f'Column "{names[0]}" not found in "{sheet}".')
+        return ix
+
+    def edit_date_before(c):  # "Edit Date | Editor Name | Deliverable"
+        return next((j for j in range(c - 1, max(-1, c - 5), -1) if H[j].startswith("edit date")), -1)
+
+    c_inward, c_sku = need(["inward date", "inward"]), need(["sku"])
+    c_style, c_shoot = find_any(["style code", "style"]), need(["shoot date"])
+    c_crew = find_any(setup["crew"])
+    sh = setup["shoot_tat"]
+    c_shoot_tat = find_any(sh["col"]) if sh else -1
+    c_shoot_act = find_any(sh["actual_col"]) if sh else -1
+    step_cols = []
+    for stp in setup["steps"]:
+        c = need(stp["deliverable"])
+        step_cols.append((stp["key"], edit_date_before(c), find_any(stp["tat_col"]),
+                          find_any(stp["actual_col"]), stp["tat"]))
+
+    def tat_of(row, col, dflt):
+        if col < 0:
+            return dflt
+        n_ = _num(row[col])
+        return n_ if n_ is not None else (dflt if BLANK_TAT_USES_DEFAULT else None)
+
+    out = []
+    for r in range(hr + 1, len(values)):
+        row = values[r]
+        sku = "" if _blank(row[c_sku]) else str(row[c_sku]).strip()
+        inward = _day(row[c_inward])
+        if not sku or inward is None:
+            continue
+        shoot_cell = row[c_shoot]
+        crew_cell = row[c_crew] if c_crew > -1 else ""
+        style = (str(row[c_style]).strip() if c_style > -1 and not _blank(row[c_style]) else "") or sku
+        o = {
+            "sheet_row": r + 1, "sku": sku, "style": style, "inward": inward, "shoot": _day(shoot_cell),
+            "has_shoot_actual": c_shoot_act > -1,
+            "shoot_actual": _num(row[c_shoot_act]) if c_shoot_act > -1 else None,
+            "shoot_outsourced": setup["shoot_outsourced"] and (
+                "outsourc" in str(shoot_cell or "").lower() or "outsourc" in str(crew_cell or "").lower()),
+            "steps": {}, "tat": {},
+        }
+        if sh:
+            o["tat"]["shoot"] = tat_of(row, c_shoot_tat, sh["tat"])
+        for key, d_col, t_col, a_col, dflt in step_cols:
+            edit_cell = row[d_col] if d_col > -1 else None
+            agency = _is_agency(edit_cell)
+            o["steps"][key] = {"date": None if agency else _day(edit_cell), "agency": agency,
+                               "actual": _num(row[a_col]) if a_col > -1 else None}
+            o["tat"][key] = tat_of(row, t_col, dflt)
+        out.append(o)
+    return out
+
+
+def tat_stages(setup: dict) -> list[dict]:
+    stages = []
+    if setup["shoot_tat"]:
+        stages.append({"key": "shoot", "label": "Inward → Shoot", "tat": setup["shoot_tat"]["tat"],
+                       "start": "inward", "basis": setup["shoot_tat"].get("basis", "Styles")})
+    out = []
+    for s_ in stages + setup["steps"]:
+        if s_["basis"] == "Both":
+            out += [{**s_, "basis": "Styles", "label": s_["label"] + " (style-wise)"},
+                    {**s_, "basis": "SKUs", "label": s_["label"] + " (SKU-wise)"}]
+        else:
+            out.append(s_)
+    return out
+
+
+def _stage_input(r: dict, stg: dict, today_n: int) -> dict:
+    """What one SKU contributes to a step: its Actual days, start date, TAT and agency flag."""
+    if stg["key"] == "shoot":
+        if r["has_shoot_actual"]:
+            a = r["shoot_actual"]
+        else:
+            a = max(0, r["shoot"] - r["inward"]) if (r["shot"] and r["shoot"] is not None) else None
+        return {"actual": a, "start": r["inward"], "tat": r["tat"].get("shoot"), "agency": False}
+    s_ = r["steps"][stg["key"]]
+    start_ = r["inward"]
+    if stg["start"] == "shoot":
+        start_ = r["shoot"] if (r["shoot"] is not None and r["shoot"] <= today_n) else None
+    act = s_["actual"]
+    if act is None and s_["date"] is not None and start_ is not None:
+        act = max(0, s_["date"] - start_)
+    return {"actual": act, "start": start_, "tat": r["tat"].get(stg["key"]),
+            "agency": act is None and s_["agency"]}
+
+
+def _group_bucket(g: list[dict], stg: dict, today_n: int):
+    """One style (or one SKU) -> 'c_within' | 'c_over' | 'p_within' | 'p_over' | 'agency' | None."""
+    tats = [x["tat"] for x in g if x["tat"] is not None]
+    if not tats:
+        return None                                                    # rule 5
+    tat = tats[0]
+    filled = [x["actual"] for x in g if x["actual"] is not None]
+    agency_n = sum(1 for x in g if x["actual"] is None and x["agency"])
+    open_n = len(g) - len(filled) - agency_n
+    starts = [x["start"] for x in g if x["start"] is not None]
+
+    def completed():
+        return "c_within" if max(filled) <= tat else "c_over"
+
+    def pending():
+        if stg["start"] == "shoot":
+            if len(starts) < len(g):
+                return None                                            # not shot yet (rule 6)
+            s0 = max(starts)
+        else:
+            s0 = min(starts) if starts else None
+        if s0 is None:
+            return None
+        return "p_within" if (today_n - s0) <= tat else "p_over"
+
+    if open_n == 0:
+        return completed() if filled else "agency"                     # rules 2 and 7
+    if not filled and agency_n == 0:                                   # rule 3
+        mode = BLANK_ACTUAL_SKU if stg["basis"] == "SKUs" else BLANK_ACTUAL_STYLE
+        return pending() if mode == "pending" else None
+    if PARTIAL_STYLE == "completed":
+        return completed() if filled else "agency"
+    return pending()                                                   # rule 4
+
+
+def tat_report(rows: list[dict], setup: dict, today_n: int) -> list[dict]:
+    rows = [dict(r) for r in rows if r["inward"] <= today_n]
+    for r in rows:
+        r["shot"] = r["shoot_outsourced"] or (r["shoot"] is not None and r["shoot"] <= today_n)
+    by_style: dict[str, list] = {}
+    for r in rows:
+        by_style.setdefault(r["style"], []).append(r)
+    result = []
+    for stg in tat_stages(setup):
+        stat = {"key": stg["key"], "label": stg["label"], "tat": stg["tat"], "basis": stg["basis"],
+                "not_counted": 0, "tats": set(), **{k: 0 for k, _, _ in TAT_BUCKETS}}
+        groups = [[r] for r in rows] if stg["basis"] == "SKUs" else list(by_style.values())
+        for g in groups:
+            inputs = [_stage_input(r, stg, today_n) for r in g]
+            b = _group_bucket(inputs, stg, today_n)
+            if b is None:
+                stat["not_counted"] += 1
+            else:
+                stat[b] += 1
+                stat["tats"].update(x["tat"] for x in inputs if x["tat"] is not None)
+        stat["counted"] = sum(stat[k] for k, _, _ in TAT_BUCKETS)
+        result.append(stat)
+    return result
+
+
+def _tat_text(stat: dict) -> str:
+    t = sorted(stat["tats"]) or [stat["tat"]]
+    return f"{t[0]:g}" if t[0] == t[-1] else f"{t[0]:g}–{t[-1]:g}"
+
+
+def _buckets_for(stat: dict) -> list:
+    """Inward -> Shoot has no edit date, so it has no 'Done by agency' bucket."""
+    return [b for b in TAT_BUCKETS if not (b[0] == "agency" and stat["key"] == "shoot")]
+
+
+def tat_report_card(stat: dict) -> str:
+    unit = "SKU" if stat["basis"] == "SKUs" else "style"
+    total = stat["counted"]
+    buckets = _buckets_for(stat)
+    bar = "".join(f"<span style='width:{stat[k] / total * 100:.2f}%;background:{c}'></span>"
+                  for k, _, c in buckets if stat[k] and total)
+    stat_html = "".join(
+        f"<div class='stat'><div class='k'><i style='background:{c}'></i>{html.escape(lbl)}</div>"
+        f"<div class='v'>{stat[k]:,}<span class='p'>{pct(stat[k], total)}</span></div></div>"
+        for k, lbl, c in buckets)
+    nc = stat["not_counted"]
+    return (
+        f"<div class='tat-card'><div class='head'><span class='title'>{html.escape(stat['label'])}</span>"
+        f"<span class='pill'>TAT {_tat_text(stat)} days</span></div>"
+        f"<div class='total'><b>{total:,}</b>{unit}{'s' if total != 1 else ''} counted · per {unit}</div>"
+        f"<div class='mini'>{bar}</div><div class='stats'>{stat_html}</div>"
+        f"<div class='foot'>{nc:,} {unit}{'s' if nc != 1 else ''} not counted</div></div>"
+    )
+
+
+def tat_report_table(stats: list[dict]) -> str:
+    dot = lambda c: f"<i style='background:{c}'></i>"
+    head = ("<tr><th>Step</th><th>TAT</th><th>Counted in</th><th class='num'>Counted</th>"
+            + "".join(f"<th class='num' colspan='2'>{dot(c)}{html.escape(lbl)}</th>" for _, lbl, c in TAT_BUCKETS)
+            + "<th class='num'>Not counted</th></tr>")
+    body = ""
+    for i, s_ in enumerate(stats, start=1):
+        keys = {k for k, _, _ in _buckets_for(s_)}
+        cells = "".join(
+            (f"<td class='num'>{s_[k]:,}</td><td class='pc'>{pct(s_[k], s_['counted'])}</td>" if k in keys
+             else "<td class='num'>–</td><td class='pc'></td>") for k, _, _ in TAT_BUCKETS)
+        body += (f"<tr><td class='step'>{i}. {html.escape(s_['label'])}</td><td>{_tat_text(s_)} days</td>"
+                 f"<td class='basis'>{s_['basis']}</td><td class='num'>{s_['counted']:,}</td>{cells}"
+                 f"<td class='num'>{s_['not_counted']:,}</td></tr>")
+    return (f"<div class='tat-table-wrap'><table class='tat-table'><thead>{head}</thead>"
+            f"<tbody>{body}</tbody></table></div>")
+
+
+# ---------------------------------------------------------------------------
 # App
 # ---------------------------------------------------------------------------
 password_gate()
@@ -278,32 +620,9 @@ if not available:
 tracker_name = st.sidebar.radio("Tracker", available, index=0)
 cfg = tk.TRACKERS[tracker_name]
 
-IS_PHOTO = "photo" in tracker_name.lower()
-
-# TAT steps counted per SKU (matched on the step name). Every other step is counted per style.
-#   Photo Shoot: Inward -> Shoot, Shoot -> MT Catalog Image
-#   Video Shoot: Inward -> Shoot, Inward -> MT Videos
-SKU_BASED_LABELS = {"shoot", "mt catalog image"} if IS_PHOTO else {"shoot", "mt videos"}
-
-# Steps that get a TAT card and a row in the TAT summary.
-#   Photo Shoot: only these 4. Other trackers: every TAT step.
-CARD_STEP_LABELS = {"shoot", "master poster", "pdf", "mt catalog image"} if IS_PHOTO else None
-
-
-def _lbl(d: str) -> str:
-    return str(cfg.label(d)).strip().lower()
-
-
-def is_sku_based(d: str) -> bool:
-    return _lbl(d) in SKU_BASED_LABELS or str(d).strip().lower() in SKU_BASED_LABELS
-
 outsourced_ok = st.sidebar.toggle(
     "Count outsourced as complete", value=True,
     help="On: a deliverable marked 'Outsource' counts as handled. Off: only 'Done' counts as complete.")
-nodate_ok = st.sidebar.toggle(
-    "Done without edit date = within TAT", value=True,
-    help="On: a deliverable marked Done with no edit date counts as completed within TAT. "
-         "Off: it counts as completed overdue. Its TAT can't be measured either way.")
 
 if st.sidebar.button("Refresh data", icon=":material/refresh:", width="stretch"):
     st.cache_data.clear()
@@ -377,7 +696,7 @@ if df.empty:
     st.stop()
 
 # Style-level frame (one row per style) for the style-based TAT cards, step table
-# and TAT charts. SKU-based steps (see SKU_BASED_LABELS), the top KPI tiles,
+# and TAT charts. the top KPI tiles,
 # Pending, Team and All data tabs stay on the SKU frame `df`.
 if cfg.tat:
     df_style = tk.style_tat_frame(df, cfg, today)
@@ -421,76 +740,8 @@ def step_name(d: str) -> str:
     return f"{start_word} → {cfg.label(d)}"
 
 
-BUCKET_KEYS = ["c_within", "c_over", "p_within", "p_over", "agency"]
-BUCKET_LABELS = {"c_within": "Completed within TAT", "c_over": "Completed overdue",
-                 "p_within": "Pending within TAT", "p_over": "Pending overdue", "agency": "Done by agency"}
-BUCKET_COLORS = {"c_within": charts.BLUE_DARK, "c_over": charts.ORANGE_DARK, "p_within": charts.BLUE_MID,
-                 "p_over": charts.ORANGE, "agency": getattr(charts, "AGENCY", "#6B4FA0")}
-
-
-def tat_buckets(oc: pd.Series) -> dict:
-    """Split TAT outcomes into five buckets plus 'not counted'.
-
-    - Completed within TAT = finished on time ('Done, no edit date' too when the sidebar toggle is on)
-    - Completed overdue    = finished after the TAT ('Done, no edit date' too when the toggle is off)
-    - Pending within TAT   = not finished, TAT date not passed yet
-    - Pending overdue      = not finished, TAT date has passed
-    - Done by agency       = Actual blank and Edit Date says "Done By Agency" (outcome from tracker.py)
-    - Not counted          = not shot yet for a shoot-based step, not needed, or no TAT
-    """
-    no_date = "c_within" if nodate_ok else "c_over"
-    groups = oc.map({
-        "On time": "c_within", "Done, no edit date": no_date, "Late": "c_over",
-        "Within TAT": "p_within", "Overdue": "p_over", "Done by agency": "agency",
-    })
-    out = {k: int((groups == k).sum()) for k in BUCKET_KEYS}
-    out["not_counted"] = int(groups.isna().sum())
-    out["total"] = sum(out[k] for k in BUCKET_KEYS)
-    return out
-
-
-def bucket_keys_for(d: str) -> list[str]:
-    """Inward -> Shoot has no edit date, so it never has a 'Done by agency' bucket."""
-    return [k for k in BUCKET_KEYS if not (k == "agency" and _lbl(d) == "shoot")]
-
-
 def tat_target_text(target: pd.Series) -> str:
     return f"{target.min():g}" if target.min() == target.max() else f"{target.min():g}–{target.max():g}"
-
-
-def tat_step_table(sku_frame: pd.DataFrame, style_frame: pd.DataFrame) -> str:
-    """HTML summary table: one row per TAT step. SKU-based steps count SKUs, the rest count styles."""
-    rows = []
-    for d in tat_steps:
-        col = f"{d}__tat_outcome"
-        sku_based = is_sku_based(d) and col in sku_frame
-        frame = sku_frame if sku_based else style_frame
-        if col not in frame:
-            continue
-        b = tat_buckets(frame[col])
-        rows.append((f"{len(rows) + 1}. {step_name(d)}", f"{tat_target_text(frame[f'{d}__tat_target'])} days",
-                     "SKUs" if sku_based else "Styles", b, bucket_keys_for(d)))
-    if not rows:
-        return ""
-
-    def cells(b, keys):
-        out = f"<td class='num'>{b['total']:,}</td>"
-        for k in BUCKET_KEYS:
-            if k in keys:
-                out += f"<td class='num'>{b[k]:,}</td><td class='pc'>{pct(b[k], b['total'])}</td>"
-            else:
-                out += "<td class='num'>–</td><td class='pc'></td>"
-        return out + f"<td class='num'>{b['not_counted']:,}</td>"
-
-    body = "".join(f"<tr><td class='step'>{html.escape(name)}</td><td>{tat}</td><td class='basis'>{basis}</td>"
-                   f"{cells(b, keys)}</tr>" for name, tat, basis, b, keys in rows)
-    dot = lambda c: f"<i style='background:{c}'></i>"
-    head = ("<tr><th>Step</th><th>TAT</th><th>Counted in</th><th class='num'>Total</th>"
-            + "".join(f"<th class='num' colspan='2'>{dot(BUCKET_COLORS[k])}{BUCKET_LABELS[k]}</th>"
-                      for k in BUCKET_KEYS)
-            + "<th class='num'>Not counted</th></tr>")
-    return (f"<div class='tat-table-wrap'><table class='tat-table'><thead>{head}</thead>"
-            f"<tbody>{body}</tbody></table></div>")
 
 
 def stage_completion_table(frame: pd.DataFrame) -> str:
@@ -521,85 +772,41 @@ def stage_completion_table(frame: pd.DataFrame) -> str:
             f"<tbody>{body}</tbody></table></div>")
 
 
-def tat_card(frame: pd.DataFrame, d: str, basis: str = "Styles") -> str:
-    """Card for one step: the five TAT buckets (they add up to the counted total)."""
-    label = cfg.label(d)
-    rule = tat_rules.get(d)
-    if rule and f"{d}__tat_outcome" in frame:
-        oc, target = frame[f"{d}__tat_outcome"], frame[f"{d}__tat_target"]
-        b = tat_buckets(oc)
-        keys = bucket_keys_for(d)
-        no_date = int((oc == "Done, no edit date").sum())
-        start_word = "Shoot" if rule.start == "shoot" else "Inward"
-        pill = f"TAT {tat_target_text(target)} days"
-        total = b["total"]
-        segments = [(b[k], BUCKET_COLORS[k]) for k in keys]
-        stats = [(BUCKET_LABELS[k], f"{b[k]:,}", BUCKET_COLORS[k], pct(b[k], total)) for k in keys]
-        avg = frame.loc[oc.isin(["On time", "Late"]), f"{d}__tat_days"].mean()
-        foot = []
-        if pd.notna(avg):
-            foot.append(f"Average {avg:.1f} days")
-        if no_date:
-            foot.append(f"{no_date:,} completed without a date")
-        foot.append(f"{b['not_counted']:,} not counted")
-    else:  # tracker without TAT columns: done vs pending only
-        status = frame[f"{d}__status"]
-        done = int(status.isin(["Done", "Outsourced", "Not needed"]).sum())
-        pending = len(frame) - done
-        start_word, pill = "Inward", "No TAT set"
-        segments = [(done, charts.BLUE_DARK), (pending, charts.ORANGE)]
-        stats = [("Completed", f"{done:,}", charts.BLUE_DARK, pct(done, len(frame))),
-                 ("Pending", f"{pending:,}", charts.ORANGE, pct(pending, len(frame)))]
-        foot = []
-        total = len(frame)
-    if basis == "SKUs":
-        total_html = f"<b>{total:,}</b>SKU{'s' if total != 1 else ''} counted"
-    else:
-        total_html = (f"<b>{total:,}</b>style{'s' if total != 1 else ''} counted · "
-                      f"{n_styles:,} style{'s' if n_styles != 1 else ''}, {n_sku:,} SKU{'s' if n_sku != 1 else ''}")
-    bar = "".join(f"<span style='width:{v / total * 100:.2f}%;background:{c}'></span>"
-                  for v, c in segments if v and total)
-    stat_html = "".join(
-        f"<div class='stat'><div class='k'><i style='background:{c}'></i>{html.escape(k)}</div>"
-        f"<div class='v'>{html.escape(v)}<span class='p'>{html.escape(p_)}</span></div></div>"
-        for k, v, c, p_ in stats)
-    return (
-        f"<div class='tat-card'><div class='head'><span class='title'>{start_word} → {html.escape(label)}</span>"
-        f"<span class='pill'>{html.escape(pill)}</span></div>"
-        f"<div class='total'>{total_html}</div>"
-        f"<div class='mini'>{bar}</div><div class='stats'>{stat_html}</div>"
-        + (f"<div class='foot'>{html.escape(' · '.join(foot))}</div>" if foot else "") + "</div>"
-    )
-
-
-tat_steps = [r.deliverable for r in cfg.tat
-             if (is_sku_based(r.deliverable) and f"{r.deliverable}__tat_outcome" in df)
-             or f"{r.deliverable}__tat_outcome" in df_style]
-if CARD_STEP_LABELS:  # Photo Shoot: only the 4 chosen steps
-    tat_steps = [d for d in tat_steps if _lbl(d) in CARD_STEP_LABELS] or tat_steps
-tat_steps = tat_steps or list(cfg.deliverables)
-tat_cards = []
-for d in tat_steps:
-    sku_based = is_sku_based(d) and f"{d}__tat_outcome" in df
-    tat_cards.append(tat_card(df if sku_based else df_style, d, "SKUs" if sku_based else "Styles"))
-
-sku_step_names = [step_name(d) for d in tat_steps if is_sku_based(d) and f"{d}__tat_outcome" in df]
-sku_note = (" and ".join(sku_step_names) + " counted in SKUs, other steps in styles") if sku_step_names \
+# TAT cards and summary: read straight from the sheet with the Apps Script rules (see the TAT engine).
+tat_kind = next((k for k in TAT_SETUP if k in str(cfg.sheet).lower() or k in str(tracker_name).lower()), None)
+tat_stats, tat_error = [], ""
+if tat_kind:
+    try:
+        tat_rows = tat_read_rows(data, cfg.sheet, tat_kind)
+        # use only the SKUs left after the filters (matched on sheet row + SKU, or on SKU)
+        keep = dict(zip(df["sheet_row"].astype(int), df["sku"].astype(str).str.strip().str.lower()))
+        picked = [r for r in tat_rows if keep.get(r["sheet_row"]) == r["sku"].lower()]
+        if len(picked) < 0.5 * min(len(df), len(tat_rows)):
+            skus = set(keep.values())
+            picked = [r for r in tat_rows if r["sku"].lower() in skus]
+        tat_stats = tat_report(picked, TAT_SETUP[tat_kind], today.toordinal())
+    except Exception as exc:
+        tat_error = f"Could not build the TAT cards: {exc}"
+tat_cards = [tat_report_card(s_) for s_ in tat_stats]
+sku_steps = [s_["label"] for s_ in tat_stats if s_["basis"] == "SKUs"]
+sku_note = (" and ".join(sku_steps) + " counted in SKUs, other steps in styles") if sku_steps \
     else "counted in styles"
 
 kpi_html = (
     f"<div class='kpi-grid' style='grid-template-columns: repeat({len(status_tiles)}, minmax(0, 1fr))'>"
     + "".join(status_tiles) + "</div>"
-    + f"<div class='kpi-section'>Turnaround vs TAT <span>· {html.escape(sku_note)} · calendar days</span></div>"
-    + f"<div class='tat-grid n{min(len(tat_cards), 4)}'>"
-    + "".join(tat_cards) + "</div>"
-    + ("<div class='kpi-section'>TAT summary by step <span>· % = share of the step's counted total "
-       "· not counted = not shot yet, not needed or no TAT</span></div>"
-       + tat_step_table(df, df_style) if cfg.tat else "")
+    + (f"<div class='kpi-section'>Turnaround vs TAT <span>· {html.escape(sku_note)} · from the Actual columns "
+       "· calendar days</span></div>"
+       + f"<div class='tat-grid n{min(len(tat_cards), 4)}'>" + "".join(tat_cards) + "</div>"
+       + "<div class='kpi-section'>TAT summary by step <span>· % = share of the step's counted total "
+         "· not counted = not shot yet or no TAT</span></div>"
+       + tat_report_table(tat_stats) if tat_stats else "")
     + "<div class='kpi-section'>Stage-wise completion <span>· styles · completed = every SKU in the style has "
       "finished the stage · pending includes overdue</span></div>"
     + stage_completion_table(df)
 )
+if tat_error:
+    st.warning(tat_error)
 st.markdown(kpi_html, unsafe_allow_html=True)
 
 # ---------------------------------------------------------------------------
